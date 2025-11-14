@@ -76,41 +76,42 @@ class ArxivPaper:
     
     @cached_property
     def tex(self) -> dict[str,str]:
+        # 关键修复：如果 PDF 链接不存在，arxiv.download_source 会崩溃
+        if self.pdf_url is None:
+            logger.warning(f"No PDF URL for {self.arxiv_id}. Skip source analysis.")
+            return None
+
         with ExitStack() as stack:
             tmpdirname = stack.enter_context(TemporaryDirectory())
-            # file = self._paper.download_source(dirpath=tmpdirname)
             try:
-                # 尝试下载源文件
                 file = self._paper.download_source(dirpath=tmpdirname)
             except HTTPError as e:
-                # 捕获 HTTP 错误
                 if e.code == 404:
-                    # 如果是 404 Not Found，说明源文件不存在，这是正常情况
                     logger.warning(f"Source for {self.arxiv_id} not found (404). Skipping source analysis.")
-                    return None # 直接返回 None，后续依赖 tex 的代码会安全地处理
+                    return None
                 else:
-                    # 如果是其他 HTTP 错误 (如 503)，这可能是临时性问题，值得记录下来
                     logger.error(f"HTTP Error {e.code} when downloading source for {self.arxiv_id}: {e.reason}")
-                    raise # 重新抛出异常，因为这可能是个需要关注的严重问题
+                    raise
             except Exception as e:
                 logger.error(f"Error when downloading source for {self.arxiv_id}: {e}")
                 return None
+
             try:
                 tar = stack.enter_context(tarfile.open(file))
             except tarfile.ReadError:
                 logger.debug(f"Failed to find main tex file of {self.arxiv_id}: Not a tar file.")
                 return None
- 
+
             tex_files = [f for f in tar.getnames() if f.endswith('.tex')]
             if len(tex_files) == 0:
                 logger.debug(f"Failed to find main tex file of {self.arxiv_id}: No tex file.")
                 return None
-            
+
             bbl_file = [f for f in tar.getnames() if f.endswith('.bbl')]
-            match len(bbl_file) :
+            match len(bbl_file):
                 case 0:
                     if len(tex_files) > 1:
-                        logger.debug(f"Cannot find main tex file of {self.arxiv_id} from bbl: There are multiple tex files while no bbl file.")
+                        logger.debug(f"Cannot find main tex file of {self.arxiv_id} from bbl.")
                         main_tex = None
                     else:
                         main_tex = tex_files[0]
@@ -118,47 +119,43 @@ class ArxivPaper:
                     main_name = bbl_file[0].replace('.bbl','')
                     main_tex = f"{main_name}.tex"
                     if main_tex not in tex_files:
-                        logger.debug(f"Cannot find main tex file of {self.arxiv_id} from bbl: The bbl file does not match any tex file.")
+                        logger.debug(f"Cannot find matching tex for bbl.")
                         main_tex = None
                 case _:
-                    logger.debug(f"Cannot find main tex file of {self.arxiv_id} from bbl: There are multiple bbl files.")
+                    logger.debug(f"Multiple bbl files.")
                     main_tex = None
+
             if main_tex is None:
-                logger.debug(f"Trying to choose tex file containing the document block as main tex file of {self.arxiv_id}")
-            #read all tex files
+                logger.debug(f"Trying to auto-detect main tex file from document block.")
+
             file_contents = {}
             for t in tex_files:
                 f = tar.extractfile(t)
                 content = f.read().decode('utf-8',errors='ignore')
-                #remove comments
                 content = re.sub(r'%.*\n', '\n', content)
                 content = re.sub(r'\\begin{comment}.*?\\end{comment}', '', content, flags=re.DOTALL)
                 content = re.sub(r'\\iffalse.*?\\fi', '', content, flags=re.DOTALL)
-                #remove redundant \n
                 content = re.sub(r'\n+', '\n', content)
                 content = re.sub(r'\\\\', '', content)
-                #remove consecutive spaces
                 content = re.sub(r'[ \t\r\f]{3,}', ' ', content)
                 if main_tex is None and re.search(r'\\begin\{document\}', content):
                     main_tex = t
                     logger.debug(f"Choose {t} as main tex file of {self.arxiv_id}")
                 file_contents[t] = content
-            
+
             if main_tex is not None:
-                main_source:str = file_contents[main_tex]
-                #find and replace all included sub-files
+                main_source = file_contents[main_tex]
                 include_files = re.findall(r'\\input\{(.+?)\}', main_source) + re.findall(r'\\include\{(.+?)\}', main_source)
                 for f in include_files:
-                    if not f.endswith('.tex'):
-                        file_name = f + '.tex'
-                    else:
-                        file_name = f
+                    file_name = f + '.tex' if not f.endswith('.tex') else f
                     main_source = main_source.replace(f'\\input{{{f}}}', file_contents.get(file_name, ''))
                 file_contents["all"] = main_source
             else:
-                logger.debug(f"Failed to find main tex file of {self.arxiv_id}: No tex file containing the document block.")
+                logger.debug(f"No tex file contains document block.")
                 file_contents["all"] = None
+
         return file_contents
+
     
     @cached_property
     def tldr(self) -> str:
